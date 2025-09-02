@@ -1,0 +1,23 @@
+NUM_EVENTS: -1 # Number of events to process // -1 means all events
+NUM_UNIQUE_EVENTS: 200000 # Number of unique events, see shape of train_meta_batch_1.parquet
+SEED: 42 # Random seed for reproducibility
+
+LATE_PULSES:
+  POISSON_MEAN: 1.0 # Mean of the Poisson distribution for the number of late pulses per event
+  CHARGE_PERC: 0.2 # Percentage of the original charge that the late pulse should have
+  CHARGE_NOISE_STD: 0.1 # Standard deviation of the Gaussian noise added to the late pulse charge
+  MEAN_TIME_OFFSET: 50 # 1/lambda for the exponential distribution of time offsets for late pulses
+
+AFTERPULSES:
+  POISSON_MEAN: 1.0 # Mean of the Poisson distribution for the number of afterpulses per event
+  POISSON_MEAN_AFTERPULSES: 2.0 # Mean of the Poisson distribution for the number of afterpulses per pulse
+  CHARGE_MEAN: 0.1 # Mean of the Gaussian distribution for the afterpulse charge
+  CHARGE_NOISE_STD: 1 # Standard deviation of the afterpulse charge
+  MEAN_TIME_OFFSET: 200 # Following a Gaussian distribution, mean time offset for afterpulses
+  TIME_OFFSET_STD: 100 # Standard deviation of the Gaussian distribution for afterpulse time offsets
+
+NOISE:
+  NOISE_RATE: 0.001 # Rate of noise hits per ns per DOM
+  CHARGE_MEAN: 3 # Mean of the Gaussian distribution for the noise hit charge
+  CHARGE_NOISE_STD: 3 # Standard deviation of the Gaussian distribution for the noise hit charge
+

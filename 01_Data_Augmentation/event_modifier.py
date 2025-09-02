@@ -5,241 +5,448 @@ import pyarrow.parquet as pq
 from pathlib import Path
 import pandas as pd
 from tqdm import tqdm  # Import tqdm for progress bar
+import yaml
+import polars as pl
+import time
 
-# Number of events to process
-NUM_EVENTS = 100000
+print("Script started.")
+script_start_time = time.time()
 
+config_path = Path('01_Data_Augmentation/250901-base_config.yaml')
+with open(config_path, 'r') as f:
+    config = yaml.safe_load(f)
+
+# Path to data files
 meta_path = Path('data/train_meta_batch_1.parquet')
 data_path = Path('data/batch_1.parquet')
 sensor_geometry_path = Path('data/sensor_geometry.csv')
 
-meta_table = pq.read_table(meta_path)
-data_table = pq.read_table(data_path)
-meta_df = meta_table.to_pandas()
-data_df = data_table.to_pandas()
+# Load as Polars DataFrame
+meta_df = pd.read_parquet(meta_path)
+data_df = pl.read_parquet(data_path)
 
-# Reset the index to make 'event_id' a regular column
-data_df.reset_index(inplace=True)
+if 'event_id' not in data_df.columns:
+    data_df = data_df.with_row_index('event_id')
+
+# Number of events to process
+NUM_EVENTS = config.get('NUM_EVENTS')
+if NUM_EVENTS == -1:
+    NUM_EVENTS = data_df['event_id'].n_unique()
+    
+CHARGE_PERC = config['LATE_PULSES']['CHARGE_PERC']
 
 # Load sensor geometry data
-sensor_geometry_df = pd.read_csv(sensor_geometry_path)
+sensor_geometry_df = pl.read_csv(sensor_geometry_path)
 
-"""
-Create late pulses by sampling from existing charges and modifying them.
-"""
-# Initialize an empty list to store new rows
-late_pulse_rows = []
+# Precompute random values (vectorized approach)
+np.random.seed(42)
+random_poisson_late = np.random.poisson(lam=config['LATE_PULSES']['POISSON_MEAN'], size=NUM_EVENTS)
+random_norm_late = np.random.normal(loc=0, scale=config['LATE_PULSES']['CHARGE_NOISE_STD'], size=NUM_EVENTS * 5)  # Extra samples to ensure enough
+random_exp_late = np.random.exponential(scale=config['LATE_PULSES']['MEAN_TIME_OFFSET'], size=NUM_EVENTS * 5)  # Extra samples to ensure enough
 
-# Loop through each unique event
-for i in tqdm(range(0, min(NUM_EVENTS, data_df['event_id'].nunique())), desc="Processing Late Pulses"):
-    # Filter data for the current event
-    event_data = data_df[data_df['event_id'] == meta_df['event_id'].iloc[i]]
-    
-    # Determine the number of samples using a Poisson distribution with mean=1
-    num_samples = np.random.poisson(lam=1)
-    
-    # If no samples are drawn, skip this event
+# Vectorized processing using group_by
+def process_late_pulses(group, idx):
+    """
+    Create late pulses by sampling from existing charges and modifying them.
+    """
+    num_samples = random_poisson_late[idx]
     if num_samples == 0:
-        continue
+        return pl.DataFrame({
+            'sensor_id': [],
+            'time': [],
+            'charge': [],
+            'auxiliary': [],
+            'event_id': [],
+            'late_pulse': [],
+            'after_pulse': [],
+            'noise': []
+        }, schema={
+            'sensor_id': pl.Int16,
+            'time': pl.Int64,
+            'charge': pl.Float64,
+            'auxiliary': pl.Boolean,
+            'event_id': pl.Int64,
+            'late_pulse': pl.Boolean,
+            'after_pulse': pl.Boolean,
+            'noise': pl.Boolean
+        })
     
-    # Sample charges from the event data
-    sampled_data = event_data[['charge', 'time', 'sensor_id', 'auxiliary']].sample(n=num_samples, random_state=42)
+    # Sample vectorized
+    sampled = group.sample(n=num_samples, seed=42)
 
-    # Create a modified pulse for each sampled charge
-    for _, row in sampled_data.iterrows():
-        charge = row['charge']
-        charge_time = row['time']
-
-        # Modify the charge to be around 20% of the original with some noise
-        modified_charge = charge * 0.2 + np.random.normal(0, 0.1)
-
-        modified_charge = max(modified_charge, 0)  # Ensure charge is non-negative
-
-        # Round charge to .X25 or .X75 to simulate quantization
-        modified_charge = round(modified_charge * 40) / 40.0
-        # Add 0.025 to .X00 or .X50 values to avoid exact zeros
-        if modified_charge * 10 % 0.5 == 0:
-            modified_charge += 0.025
-            modified_charge = float(f"{modified_charge:.3f}")
-
-        # Modify the time of this charge to be exponentially later than its original time with some noise
-        modified_charge_time = round(charge_time + np.random.exponential(scale=50))
-        
-        # Create a new row with the modified values
-        new_row = {
-            'event_id': event_data['event_id'].iloc[0],
-            'sensor_id': row['sensor_id'],
-            'time': modified_charge_time,
-            'charge': modified_charge,
-            'auxiliary': row['auxiliary'],
-            'late_pulse': True,
-            'after_pulse': False,
-            'noise': False
-        }
-        
-        # Append the new row to the list
-        late_pulse_rows.append(new_row)
-
-# Combine all new rows into a new DataFrame
-late_pulses_df = pd.DataFrame(late_pulse_rows)
-
-"""
-Create after pulses by sampling from existing charges and modifying them.
-"""
-# Initialize an empty list to store new rows
-after_pulse_rows = []
-
-# Loop through each unique event
-for i in tqdm(range(0, min(NUM_EVENTS, data_df['event_id'].nunique())), desc="Processing After Pulses"):
-    # Filter data for the current event
-    event_data = data_df[data_df['event_id'] == meta_df['event_id'].iloc[i]]
+    # Extract as numpy arrays for fast numpy computations
+    sampled_charges = sampled['charge'].to_numpy()
+    sampled_times = sampled['time'].to_numpy()
+    sampled_sensor_ids = sampled['sensor_id'].to_numpy()
+    sampled_auxiliary = sampled['auxiliary'].to_numpy()
     
-    # Determine the number of samples using a Poisson distribution with mean=1
-    num_samples = np.random.poisson(lam=1)
+    # Vectorized modifications
+    modified_charges = (sampled_charges * CHARGE_PERC + random_norm_late[:len(sampled)]).clip(0)
+    modified_charges = (modified_charges * 40).round() / 40.0
+    # Add 0.025 to .X00 or .X50 values to avoid exact, using numpy
+    mask = (modified_charges * 10) % 0.5 == 0
+    modified_charges[mask] += 0.025
+    modified_charges = np.round(modified_charges, 3)
     
-    # If no samples are drawn, skip this event
+    modified_times = np.round(sampled_times + random_exp_late[:len(sampled)]).astype(np.int64)
+
+    return pl.DataFrame({
+        'sensor_id': sampled_sensor_ids.astype(np.int16),
+        'time': modified_times,
+        'charge': modified_charges,
+        'auxiliary': sampled_auxiliary,
+        'event_id': np.int64(group['event_id'][0]),
+        'late_pulse': True,
+        'after_pulse': False,
+        'noise': False
+    },
+    orient='row'
+    )
+
+# Apply to each group (fast with index)
+late_pulses_list = []
+start_time = time.time()
+
+for idx, (event_id, group) in enumerate(data_df.group_by('event_id')):
+    late_pulses_list.append(process_late_pulses(group, idx))
+
+    # Stop after NUM_EVENTS
+    if idx + 1 >= NUM_EVENTS:
+        break
+
+end_time = time.time()
+print(f"Late pulse generation took {end_time - start_time:.2f} seconds.")
+
+late_pulses_df = pl.concat(late_pulses_list)
+
+
+# Precompute random values for after pulses
+random_poisson_after = np.random.poisson(lam=config['AFTERPULSES']['POISSON_MEAN'], size=NUM_EVENTS)
+random_poisson_after_per_pulse = np.random.poisson(lam=config['AFTERPULSES']['POISSON_MEAN_AFTERPULSES'], size=NUM_EVENTS * 10)
+random_norm_after_charge = np.random.normal(loc=config['AFTERPULSES']['CHARGE_MEAN'], scale=config['AFTERPULSES']['CHARGE_NOISE_STD'], size=NUM_EVENTS * 20)
+random_norm_after_time = np.random.normal(loc=config['AFTERPULSES']['MEAN_TIME_OFFSET'], scale=config['AFTERPULSES']['TIME_OFFSET_STD'], size=NUM_EVENTS * 20)
+
+def process_after_pulses(group, idx):
+    """
+    Create after pulses by sampling from existing charges and modifying them.
+    """
+    num_samples = random_poisson_after[idx]
     if num_samples == 0:
-        continue
+        return pl.DataFrame({
+            'sensor_id': [],
+            'time': [],
+            'charge': [],
+            'auxiliary': [],
+            'event_id': [],
+            'late_pulse': [],
+            'after_pulse': [],
+            'noise': []
+        }, schema={
+            'sensor_id': pl.Int16,
+            'time': pl.Int64,
+            'charge': pl.Float64,
+            'auxiliary': pl.Boolean,
+            'event_id': pl.Int64,
+            'late_pulse': pl.Boolean,
+            'after_pulse': pl.Boolean,
+            'noise': pl.Boolean
+        })
     
-    # Sample charges from the event data
-    sampled_data = event_data[['charge', 'time', 'sensor_id', 'auxiliary']].sample(n=num_samples, random_state=42)
-
-    # Create a modified pulse for each sampled charge
-    for _, row in sampled_data.iterrows():
+    # Sample vectorized
+    sampled = group.sample(n=num_samples, seed=42)
+    
+    # Extract as numpy arrays
+    sampled_charges = sampled['charge'].to_numpy()
+    sampled_times = sampled['time'].to_numpy()
+    sampled_sensor_ids = sampled['sensor_id'].to_numpy()
+    sampled_auxiliary = sampled['auxiliary'].to_numpy()
+    
+    after_pulse_rows = []
+    pulse_idx = 0
+    
+    for i in range(len(sampled_charges)):
+        charge = sampled_charges[i]
+        charge_time = sampled_times[i]
+        sensor_id = sampled_sensor_ids[i]
+        auxiliary = sampled_auxiliary[i]
         
-        charge = row['charge']
-        charge_time = row['time']
-        sensor_id = row['sensor_id']
-        auxiliary = row['auxiliary']
+        # Number of after pulses for this pulse
+        num_after_pulses = random_poisson_after_per_pulse[pulse_idx % len(random_poisson_after_per_pulse)]
+        pulse_idx += 1
         
-        # Create a  number of after pulses based on a Poisson distribution with mean=2
-        num_after_pulses = np.random.poisson(lam=2)
-        for _ in range(num_after_pulses):
-            # Modify the charge to be around 100% of the original with some noise
-            modified_charge = charge  * np.random.normal(1, 2)
-
-            modified_charge = max(modified_charge, 0)  # Ensure charge is non-negative
-
-            # Round charge to .X25 or .X75 to simulate quantization
-            modified_charge = round(modified_charge * 40) / 40.0
-            # Add 0.025 to .X00 or .X50 values to avoid exact
+        for j in range(num_after_pulses):
+            if pulse_idx >= len(random_norm_after_charge):
+                break
+                
+            # Modify charge
+            modified_charge = charge * random_norm_after_charge[pulse_idx]
+            modified_charge = max(modified_charge, 0)
+            modified_charge = np.round(modified_charge * 40) / 40.0
+            
+            # Add 0.025 to avoid exact values
             if modified_charge * 10 % 0.5 == 0:
                 modified_charge += 0.025
-                modified_charge = float(f"{modified_charge:.3f}")
+            modified_charge = np.round(modified_charge, 3)
             
-            # Modify the time of this charge to be significantly later than its original time with some noise
-            modified_charge_time = round(charge_time + np.random.normal(200, 100))
+            # Modify time
+            modified_time = np.round(charge_time + random_norm_after_time[pulse_idx])
+            pulse_idx += 1
             
-            # Create a new row with the modified values
-            new_row = {
-                'event_id': event_data['event_id'].iloc[0],
-                'sensor_id': sensor_id,
-                'time': modified_charge_time,
-                'charge': modified_charge,
-                'auxiliary': auxiliary,
-                'late_pulse': False,
-                'after_pulse': True,
-                'noise': False
-            }
-            
-            # Append the new row to the list
-            after_pulse_rows.append(new_row)
-
-# Combine all new rows into a new DataFrame
-after_pulses_df = pd.DataFrame(after_pulse_rows)
-
-"""
-Add noise to the event data
-"""
-noise_rows = []
-# Loop through each unique event
-for i in tqdm(range(0, min(NUM_EVENTS, data_df['event_id'].nunique())), desc="Adding noise"):
-    # Filter data for the current event
-    event_data = data_df[data_df['event_id'] == meta_df['event_id'].iloc[i]]
+            after_pulse_rows.append([
+                sensor_id,
+                modified_time,
+                modified_charge,
+                auxiliary,
+                group['event_id'][0],
+                False,  # late_pulse
+                True,   # after_pulse
+                False   # noise
+            ])
     
-    # Determine the number of noise hits to add using a Poisson distribution with mean=5
-    num_noise_hits = np.random.poisson(lam=5)
+    if not after_pulse_rows:
+        return pl.DataFrame()
     
-    # If no noise hits are to be added, skip this event
+    return pl.DataFrame(
+        after_pulse_rows,
+        schema={
+            'sensor_id': pl.Int16,
+            'time': pl.Int64,
+            'charge': pl.Float64,
+            'auxiliary': pl.Boolean,
+            'event_id': pl.Int64,
+            'late_pulse': pl.Boolean,
+            'after_pulse': pl.Boolean,
+            'noise': pl.Boolean
+        },
+        orient='row'
+    )
+
+# Apply after pulses processing
+after_pulses_list = []
+start_time = time.time()
+
+for idx, (event_id, group) in enumerate(data_df.group_by('event_id')):
+    after_pulses_list.append(process_after_pulses(group, idx))
+    
+    if idx + 1 >= NUM_EVENTS:
+        break
+
+end_time = time.time()
+print(f"After pulse generation took {end_time - start_time:.2f} seconds.")
+
+after_pulses_df = pl.concat(after_pulses_list) if after_pulses_list else pl.DataFrame()
+
+# Precompute random values for noise
+random_norm_noise_charge = np.random.normal(loc=config['NOISE']['CHARGE_MEAN'], scale=config['NOISE']['CHARGE_NOISE_STD'], size=NUM_EVENTS * 50)
+random_uniform_noise_time = np.random.uniform(0, 1, size=NUM_EVENTS * 50)
+
+# Convert sensor_geometry to Polars for consistency
+sensor_ids_array = sensor_geometry_df['sensor_id'].to_numpy()
+
+def process_noise(group, idx):
+    """
+    Add noise hits based on event time duration and noise rate.
+    """
+    # Calculate event duration
+    time_min = group['time'].min()
+    time_max = group['time'].max()
+    event_duration = time_max - time_min
+    
+    # Calculate number of noise hits based on duration and rate
+    # NOISE_RATE is hits per nanosecond, so multiply by duration
+    expected_noise_hits = config['NOISE']['NOISE_RATE'] * event_duration
+    num_noise_hits = np.random.poisson(lam=expected_noise_hits)
+    
     if num_noise_hits == 0:
-        continue
+        return pl.DataFrame({
+            'sensor_id': [],
+            'time': [],
+            'charge': [],
+            'auxiliary': [],
+            'event_id': [],
+            'late_pulse': [],
+            'after_pulse': [],
+            'noise': []
+        }, schema={
+            'sensor_id': pl.Int16,
+            'time': pl.Int64,
+            'charge': pl.Float64,
+            'auxiliary': pl.Boolean,
+            'event_id': pl.Int64,
+            'late_pulse': pl.Boolean,
+            'after_pulse': pl.Boolean,
+            'noise': pl.Boolean
+        })
     
-    # Randomly select sensor_ids from the sensor geometry data
-    sampled_sensors = sensor_geometry_df['sensor_id'].sample(n=num_noise_hits, replace=True, random_state=42) # Allow sensor to be sampled multiple times
+    # Sample sensor IDs
+    sampled_sensor_ids = np.random.choice(sensor_ids_array, size=num_noise_hits, replace=True).astype(np.int16)
+    
+    # Generate random times within extended event window
+    time_range_start = int(time_min - 100)
+    time_range_end = int(time_max + 100)
+    random_times = np.random.uniform(time_range_start, time_range_end, size=num_noise_hits)
+    random_times = np.round(random_times).astype(np.int64)
 
-    # Pick time randomly 
-    random_time = int(np.random.uniform(event_data['time'].min()-100, event_data['time'].max()+100))
+    
+    # Generate random charges
+    start_idx = (idx * 50) % len(random_norm_noise_charge)
+    end_idx = min(start_idx + num_noise_hits, len(random_norm_noise_charge))
+    actual_samples = end_idx - start_idx
+    
+    if actual_samples < num_noise_hits:
+        # If we don't have enough precomputed values, generate on the fly
+        random_charges = np.random.normal(config['NOISE']['CHARGE_MEAN'], config['NOISE']['CHARGE_NOISE_STD'], num_noise_hits)
+    else:
+        random_charges = random_norm_noise_charge[start_idx:end_idx]
+    
+    # Process charges
+    random_charges = np.maximum(random_charges, 0)  # Ensure non-negative
+    random_charges = np.round(random_charges * 40) / 40.0
+    
+    # Add 0.025 to avoid exact values
+    mask = (random_charges * 10) % 0.5 == 0
+    random_charges[mask] += 0.025
+    random_charges = np.round(random_charges, 3)
+    
+    # Create noise DataFrame
+    noise_data = []
+    for i in range(num_noise_hits):
+        noise_data.append([
+            sampled_sensor_ids[i],
+            random_times[i],
+            random_charges[i],
+            True,  # auxiliary
+            group['event_id'][0],
+            False,  # late_pulse
+            False,  # after_pulse
+            True    # noise
+        ])
+    
+    return pl.DataFrame(
+        noise_data,
+        schema={
+            'sensor_id': pl.Int16,
+            'time': pl.Int64,
+            'charge': pl.Float64,
+            'auxiliary': pl.Boolean,
+            'event_id': pl.Int64,
+            'late_pulse': pl.Boolean,
+            'after_pulse': pl.Boolean,
+            'noise': pl.Boolean
+        },
+        orient='row'
+    )
 
-    # Pick a random charge around 3 with some noise
-    random_charge = max(np.random.normal(3, 3), 0)
-    # Round charge to .X25 or .X75 to simulate quantization
-    random_charge = round(random_charge * 40) / 40.0
-    # Add 0.025 to .X00 or .X50 values to avoid exact
-    if random_charge * 10 % 0.5 == 0:
-        random_charge += 0.025
-        random_charge = float(f"{random_charge:.3f}")
+# Apply noise processing
+noise_list = []
+start_time = time.time()
 
-    for sensor_id in sampled_sensors:
-        # Create a new noise hit
-        new_row = {
-            'event_id': event_data['event_id'].iloc[0],
-            'sensor_id': sensor_id,
-            'time': random_time,
-            'charge': random_charge,
-            'auxiliary': False,
-            'late_pulse': False,
-            'after_pulse': False,
-            'noise': True
-        }
-        
-        # Append the new row to the list
-        noise_rows.append(new_row)
+for idx, (event_id, group) in enumerate(data_df.group_by('event_id')):
+    noise_list.append(process_noise(group, idx))
+    
+    if idx + 1 >= NUM_EVENTS:
+        break
 
-# Combine all new rows into a new DataFrame
-noise_df = pd.DataFrame(noise_rows)
+end_time = time.time()
+print(f"Noise generation took {end_time - start_time:.2f} seconds.")
 
+noise_df = pl.concat(noise_list) if noise_list else pl.DataFrame()
 
-# Add 'late_pulse', 'after_pulse', and 'noise' columns to the original data
-data_df['late_pulse'] = False
-data_df['after_pulse'] = False
-data_df['noise'] = False
+print(f"Adding flag columns...")
+flag_start_time = time.time()
+# Add columns to original data
+data_df_with_flags = data_df.with_columns([
+    pl.lit(False).alias('late_pulse'),
+    pl.lit(False).alias('after_pulse'), 
+    pl.lit(False).alias('noise')
+])
 
-# Combine the original data with the new late and after pulses
-augmented_data_df = pd.concat([data_df, late_pulses_df, after_pulses_df, noise_df], ignore_index=True)
+# Filter data_df to only first NUM_EVENTS (for efficiency)
+unique_event_ids = data_df['event_id'].unique().sort()[:NUM_EVENTS]
+data_df_filtered = data_df_with_flags.filter(pl.col('event_id').is_in(pl.Series(unique_event_ids).implode()))
+flag_end_time = time.time()
+print(f"Flag column addition took {flag_end_time - flag_start_time:.2f} seconds.")
 
-# Create a new augmented_meta_batch_1 DataFrame
-augmented_meta_batch_1 = meta_df.copy()
+print(f"Filtering data_df to first NUM_EVENTS...")
+filter_start_time = time.time()
+# Filter data_df to only first NUM_EVENTS (for efficiency)
+unique_event_ids = data_df['event_id'].unique().sort()[:NUM_EVENTS]
+data_df_filtered = data_df_with_flags.filter(pl.col('event_id').is_in(pl.Series(unique_event_ids).implode()))
+filter_end_time = time.time()
+print(f"Filtering took {filter_end_time - filter_start_time:.2f} seconds.")
 
 print(f'Sorting augmented data by event_id and time...')
-# Sort the augmented data by event_id and time to ensure proper indexing
-augmented_data_df = augmented_data_df.sort_values(by=['event_id', 'time']).reset_index(drop=True)
+concat_sort_start_time = time.time()
+# Combine all DataFrames in Polars (much faster than pandas concat)
+dataframes_to_combine = [data_df_filtered]
 
+if not late_pulses_df.is_empty():
+    dataframes_to_combine.append(late_pulses_df)
+    
+if not after_pulses_df.is_empty():
+    dataframes_to_combine.append(after_pulses_df)
+    
+if not noise_df.is_empty():
+    dataframes_to_combine.append(noise_df)
 
-# Filter the meta data to include only the first NUM_EVENTS events
-filtered_meta_batch = augmented_meta_batch_1[augmented_meta_batch_1['event_id'].isin(meta_df['event_id'][:NUM_EVENTS])].copy()
+# Concatenate in Polars (very fast)
+augmented_data_pl = pl.concat(dataframes_to_combine, how="vertical")
 
-# Initialize lists to store the first and last pulse indices
-first_pulse_indices = []
-last_pulse_indices = []
+# Sort in Polars (much faster than pandas, especially for large data)
+augmented_data_pl = augmented_data_pl.sort(['event_id', 'time'])
+concat_sort_end_time = time.time()
+print(f"Combining and sorting took {concat_sort_end_time - concat_sort_start_time:.2f} seconds.")
 
-# Update metadata for the first NUM_EVENTS events
-for event_id in tqdm(filtered_meta_batch['event_id'], desc=f"Updating Meta Data for First {NUM_EVENTS} Events"):
-    # Get the indices of the first and last pulses for the current event
-    event_indices = augmented_data_df[augmented_data_df['event_id'] == event_id].index
-    first_pulse_indices.append(event_indices.min())
-    last_pulse_indices.append(event_indices.max())
+print(f'Updating metadata...')
+metadata_start_time = time.time()
+# Create metadata more efficiently using groupby
+metadata_updates = (
+    augmented_data_pl
+    .filter(pl.col('event_id').is_in(pl.Series(unique_event_ids).implode()))
+    .with_row_index('row_idx')  # Add row indices
+    .group_by('event_id')
+    .agg([
+        pl.col('row_idx').min().alias('first_pulse_index'),
+        pl.col('row_idx').max().alias('last_pulse_index')
+    ])
+    .sort('event_id')
+)
 
-# Update the filtered_meta_batch DataFrame
-filtered_meta_batch['first_pulse_index'] = first_pulse_indices
-filtered_meta_batch['last_pulse_index'] = last_pulse_indices
+# Convert to pandas for the join (since meta_df is pandas)
+metadata_updates_pd = metadata_updates.to_pandas()
 
-# Save the filtered metadata to a new file
+# Filter and update meta data more efficiently
+filtered_meta_batch = meta_df[meta_df['event_id'].isin(unique_event_ids.to_pandas())].copy()
+filtered_meta_batch = filtered_meta_batch.merge(
+    metadata_updates_pd[['event_id', 'first_pulse_index', 'last_pulse_index']], 
+    on='event_id', 
+    how='left',
+    suffixes=('', '_new')
+)
+
+# Update the columns
+filtered_meta_batch['first_pulse_index'] = filtered_meta_batch['first_pulse_index_new']
+filtered_meta_batch['last_pulse_index'] = filtered_meta_batch['last_pulse_index_new']
+filtered_meta_batch = filtered_meta_batch.drop(columns=['first_pulse_index_new', 'last_pulse_index_new'])
+metadata_end_time = time.time()
+print(f"Metadata update took {metadata_end_time - metadata_start_time:.2f} seconds.")
+
+print(f"Saving files...")
+save_start_time = time.time()
+# Save files (convert to pandas only for saving if needed)
+augmented_data_df = augmented_data_pl.to_pandas()  # Only convert once at the end
+
+# Save files
 filtered_meta_batch_path = Path('data/filtered_meta_batch_1.parquet')
-filtered_meta_batch.to_parquet(filtered_meta_batch_path, index=False)
-
-# Save the augmented data (optional, if not already saved)
 augmented_data_df_path = Path('data/augmented_data_df.parquet')
+
+filtered_meta_batch.to_parquet(filtered_meta_batch_path, index=False)
 augmented_data_df.to_parquet(augmented_data_df_path, index=False)
+save_end_time = time.time()
+print(f"Saving files took {save_end_time - save_start_time:.2f} seconds.")
+
+script_end_time = time.time()
+print(f"Total script execution time: {script_end_time - script_start_time:.2f} seconds.")
 
 print(f"Filtered meta data for first {NUM_EVENTS} events saved to {filtered_meta_batch_path}")
 print(f"Augmented event data saved to {augmented_data_df_path}")
