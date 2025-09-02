@@ -1,6 +1,17 @@
 import torch
 import torch.nn as nn
 from flash_attn import flash_attn_func  # Install on server: pip install flash-attn
+import yaml
+from pathlib import Path
+# Load configuration
+config_path = Path('02_Adverserial_Network/250902-config.yaml')
+with open(config_path, 'r') as f:
+    config = yaml.safe_load(f)
+MODEL_PARAMS = config.get('MODEL_PARAMS')
+EMBED_DIM = MODEL_PARAMS.get('EMBED_DIM')
+NUM_HEADS = MODEL_PARAMS.get('NUM_HEADS')
+NUM_LAYERS = MODEL_PARAMS.get('NUM_LAYERS')
+DROPOUT = MODEL_PARAMS.get('DROPOUT')
 
 class FlashAttentionLayer(nn.Module):
     def __init__(self, embed_dim, num_heads):
@@ -14,12 +25,12 @@ class FlashAttentionLayer(nn.Module):
         B, N, C = x.shape
         qkv = self.qkv_proj(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
-        attn_output = flash_attn_func(q, k, v, dropout_p=0.0)
+        attn_output = flash_attn_func(q, k, v, dropout_p=DROPOUT)
         attn_output = attn_output.transpose(1, 2).reshape(B, N, C)
         return self.out_proj(attn_output)
 
 class TransformerClassifier(nn.Module):
-    def __init__(self, input_dim=4, embed_dim=128, num_heads=8, num_layers=4, num_classes=2):
+    def __init__(self, input_dim=4, embed_dim=EMBED_DIM, num_heads=NUM_HEADS, num_layers=NUM_LAYERS, num_classes=2):
         super().__init__()
         self.embedding = nn.Linear(input_dim, embed_dim)
         self.layers = nn.ModuleList([

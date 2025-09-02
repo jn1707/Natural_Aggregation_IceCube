@@ -2,6 +2,15 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 import pickle
 import numpy as np
+import yaml
+from pathlib import Path
+
+# Load configuration
+config_path = Path('02_Adverserial_Network/250902-config.yaml')
+with open(config_path, 'r') as f:
+    config = yaml.safe_load(f)
+
+BATCH_SIZE = config.get('BATCH_SIZE')
 
 class EventDataset(Dataset):
     def __init__(self, sequences, labels):
@@ -28,7 +37,7 @@ def collate_fn(batch):
         padded_sequences.append(padded_seq)
     return torch.stack(padded_sequences), torch.tensor(labels)
 
-def get_data_loader(data_path, batch_size=32, shuffle=True):
+def get_data_loader(data_path, batch_size=BATCH_SIZE, shuffle=True):
     with open(data_path, 'rb') as f:
         data = pickle.load(f)
     dataset = EventDataset(data['sequences'], data['labels'])
@@ -36,7 +45,7 @@ def get_data_loader(data_path, batch_size=32, shuffle=True):
 
 # Example usage
 if __name__ == "__main__":
-    loader = get_data_loader("../data/preprocessed_sequences.pkl", batch_size=4)
+    loader = get_data_loader("../data/preprocessed_sequences.pkl", batch_size=BATCH_SIZE)
     for batch in loader:
         print(batch[0].shape, batch[1])  # Test shapes
         break

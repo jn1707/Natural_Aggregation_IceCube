@@ -15,3 +15,6 @@ __pycache__/
 # Ignore system files
 .DS_Store
 Thumbs.db
+
+# Ignore .python-version file
+.python-version
