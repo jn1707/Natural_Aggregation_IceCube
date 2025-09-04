@@ -1,6 +1,8 @@
 NUM_EVENTS: -1 # Number of events to process // -1 means all events
+NUM_EVENTS_PMT: 5000000 # Number of events at a PMT to process // -1 means all events
 NUM_UNIQUE_EVENTS: 200000 # Number of unique events, see shape of train_meta_batch_1.parquet
 SEED: 42 # Random seed for reproducibility
+TRAIN_TEST_SPLIT: 0.1 # Proportion of the dataset to include in the test split
 
 LATE_PULSES:
   POISSON_MEAN: 1.0 # Mean of the Poisson distribution for the number of late pulses per event
