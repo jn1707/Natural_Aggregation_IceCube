@@ -18,3 +18,7 @@ Thumbs.db
 
 # Ignore .python-version file
 .python-version
+
+# Ignore lightning_logs and logs
+lightning_logs/
+logs/
