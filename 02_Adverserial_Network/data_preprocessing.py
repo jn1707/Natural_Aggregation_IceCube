@@ -32,6 +32,7 @@ def extract_sequences(meta_df, data_df, label, num_events):
     grouped = data_df.groupby('event_id')
     sequences = []
     labels = []
+    event_ids_out = []
     for event_id, group in grouped:
         pulses = group[['sensor_id', 'time', 'charge', 'auxiliary']].astype({
             'sensor_id': np.int16,
@@ -42,9 +43,10 @@ def extract_sequences(meta_df, data_df, label, num_events):
         if len(pulses) > 0:
             sequences.append(pulses)
             labels.append(label)
-    return sequences, labels
+            event_ids_out.append(event_id)
+    return sequences, labels, event_ids_out
 
-def preprocess_data(meta_path, data_path, original_meta_path, original_data_path, output_paths):
+def preprocess_data(meta_path, data_path, original_meta_path, original_data_path, output_paths, eventid_paths):
     # Load data
     print("Loading data...")
     meta_df = pd.read_parquet(meta_path)
@@ -67,20 +69,21 @@ def preprocess_data(meta_path, data_path, original_meta_path, original_data_path
     # Vectorized extraction
     print("Extracting sequences...")
     start_time = time.time()
-    orig_sequences, orig_labels = extract_sequences(original_meta_df, original_data_df, label=0, num_events=NUM_EVENTS)
+    orig_sequences, orig_labels, orig_event_ids = extract_sequences(original_meta_df, original_data_df, label=0, num_events=NUM_EVENTS)
     end_time = time.time()
     print(f"Extracted {len(orig_sequences)} original sequences in {end_time - start_time:.2f} seconds")
-    aug_sequences, aug_labels = extract_sequences(meta_df, data_df, label=1, num_events=NUM_EVENTS)
+    aug_sequences, aug_labels, aug_event_ids = extract_sequences(meta_df, data_df, label=1, num_events=NUM_EVENTS)
 
     # Concatenate
     sequences = orig_sequences + aug_sequences
     labels = orig_labels + aug_labels
+    event_ids = orig_event_ids + aug_event_ids
 
     # Train-test split
-    X_train, X_test, y_train, y_test = train_test_split(sequences, labels, test_size=config2['TRAIN_TEST_SPLIT'], random_state=42)
+    X_train, X_test, y_train, y_test, event_ids_train, event_ids_test = train_test_split(sequences, labels, event_ids, test_size=config2['TRAIN_TEST_SPLIT'], random_state=42)
 
     # Train-validation split
-    X_train, X_val, y_train, y_val = train_test_split(X_train, y_train, test_size=config2['TRAIN_TEST_SPLIT'], random_state=42)
+    X_train, X_val, y_train, y_val, event_ids_train, event_ids_val = train_test_split(X_train, y_train, event_ids_train, test_size=config2['TRAIN_TEST_SPLIT'], random_state=42)
 
     # Save sequences and labels
     print("Saving preprocessed data...")
@@ -95,6 +98,20 @@ def preprocess_data(meta_path, data_path, original_meta_path, original_data_path
     with open(output_paths[2], 'wb') as f:
         pickle.dump({'sequences': X_test, 'labels': y_test}, f)
     print(f"Preprocessed {len(X_test)} testing sequences saved to {output_paths[2]}")
+    
+    # Save event_ids for each split
+    with open(eventid_paths[0], 'wb') as f:
+        pickle.dump(event_ids_train, f)
+    with open(eventid_paths[1], 'wb') as f:
+        pickle.dump(event_ids_val, f)
+    with open(eventid_paths[2], 'wb') as f:
+        pickle.dump(event_ids_test, f)
+
+    print(f"Preprocessed {len(X_train)} training sequences saved to {output_paths[0]}")
+    print(f"Preprocessed {len(X_val)} validation sequences saved to {output_paths[1]}")
+    print(f"Preprocessed {len(X_test)} testing sequences saved to {output_paths[2]}")
+    print(f"Event IDs for test set saved to {eventid_paths[2]}")
+
 
 if __name__ == "__main__":
     preprocess_data(
@@ -102,5 +119,6 @@ if __name__ == "__main__":
         data_path="data/augmented_data_df.parquet",
         original_meta_path="data/train_meta_batch_1.parquet",
         original_data_path="data/batch_1.parquet",
-        output_paths=("data/preprocessed_sequences_train.pkl", "data/preprocessed_sequences_val.pkl", "data/preprocessed_sequences_test.pkl")
+        output_paths=("data/preprocessed_sequences_train.pkl", "data/preprocessed_sequences_val.pkl", "data/preprocessed_sequences_test.pkl"),
+        eventid_paths=("data/event_ids_train.pkl", "data/event_ids_val.pkl", "data/event_ids_test.pkl")
     )

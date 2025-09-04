@@ -22,7 +22,7 @@ data_path = Path('data/batch_1.parquet')
 sensor_geometry_path = Path('data/sensor_geometry.csv')
 
 # Load as Polars DataFrame
-meta_df = pd.read_parquet(meta_path)
+meta_df = pl.read_parquet(meta_path)
 data_df = pl.read_parquet(data_path)
 
 if 'event_id' not in data_df.columns:
@@ -352,6 +352,7 @@ print(f"Noise generation took {end_time - start_time:.2f} seconds.")
 
 noise_df = pl.concat(noise_list) if noise_list else pl.DataFrame()
 
+#------------------------------------------------------
 print(f"Adding flag columns...")
 flag_start_time = time.time()
 # Add columns to original data
@@ -360,16 +361,12 @@ data_df_with_flags = data_df.with_columns([
     pl.lit(False).alias('after_pulse'), 
     pl.lit(False).alias('noise')
 ])
-
-# Filter data_df to only first NUM_EVENTS (for efficiency)
-unique_event_ids = data_df['event_id'].unique().sort()[:NUM_EVENTS]
-data_df_filtered = data_df_with_flags.filter(pl.col('event_id').is_in(pl.Series(unique_event_ids).implode()))
 flag_end_time = time.time()
 print(f"Flag column addition took {flag_end_time - flag_start_time:.2f} seconds.")
 
 print(f"Filtering data_df to first NUM_EVENTS...")
 filter_start_time = time.time()
-# Filter data_df to only first NUM_EVENTS (for efficiency)
+# Filter data_df to first NUM_EVENTS 
 unique_event_ids = data_df['event_id'].unique().sort()[:NUM_EVENTS]
 data_df_filtered = data_df_with_flags.filter(pl.col('event_id').is_in(pl.Series(unique_event_ids).implode()))
 filter_end_time = time.time()
@@ -377,29 +374,21 @@ print(f"Filtering took {filter_end_time - filter_start_time:.2f} seconds.")
 
 print(f'Sorting augmented data by event_id and time...')
 concat_sort_start_time = time.time()
-# Combine all DataFrames in Polars (much faster than pandas concat)
+# Combine all DataFrames in Polars
 dataframes_to_combine = [data_df_filtered]
+dataframes_to_combine.append(late_pulses_df)
+dataframes_to_combine.append(after_pulses_df)
+dataframes_to_combine.append(noise_df)
 
-if not late_pulses_df.is_empty():
-    dataframes_to_combine.append(late_pulses_df)
-    
-if not after_pulses_df.is_empty():
-    dataframes_to_combine.append(after_pulses_df)
-    
-if not noise_df.is_empty():
-    dataframes_to_combine.append(noise_df)
-
-# Concatenate in Polars (very fast)
+# Concatenate and sort
 augmented_data_pl = pl.concat(dataframes_to_combine, how="vertical")
-
-# Sort in Polars (much faster than pandas, especially for large data)
 augmented_data_pl = augmented_data_pl.sort(['event_id', 'time'])
 concat_sort_end_time = time.time()
 print(f"Combining and sorting took {concat_sort_end_time - concat_sort_start_time:.2f} seconds.")
 
 print(f'Updating metadata...')
 metadata_start_time = time.time()
-# Create metadata more efficiently using groupby
+# Calculate first and last pulse indices for each event_id
 metadata_updates = (
     augmented_data_pl
     .filter(pl.col('event_id').is_in(pl.Series(unique_event_ids).implode()))
@@ -412,36 +401,29 @@ metadata_updates = (
     .sort('event_id')
 )
 
-# Convert to pandas for the join (since meta_df is pandas)
-metadata_updates_pd = metadata_updates.to_pandas()
+# Filter meta_df to only relevant event_ids
+filtered_meta_batch = meta_df.filter(pl.col('event_id').is_in(pl.Series(unique_event_ids).implode()))
 
-# Filter and update meta data more efficiently
-filtered_meta_batch = meta_df[meta_df['event_id'].isin(unique_event_ids.to_pandas())].copy()
-filtered_meta_batch = filtered_meta_batch.merge(
-    metadata_updates_pd[['event_id', 'first_pulse_index', 'last_pulse_index']], 
-    on='event_id', 
-    how='left',
-    suffixes=('', '_new')
+# Drop old pulse index columns if present
+filtered_meta_batch = filtered_meta_batch.drop(['first_pulse_index', 'last_pulse_index'])
+
+# Merge with metadata_updates (Polars join)
+filtered_meta_batch = filtered_meta_batch.join(
+    metadata_updates.select(['event_id', 'first_pulse_index', 'last_pulse_index']),
+    on='event_id',
+    how='left'
 )
-
-# Update the columns
-filtered_meta_batch['first_pulse_index'] = filtered_meta_batch['first_pulse_index_new']
-filtered_meta_batch['last_pulse_index'] = filtered_meta_batch['last_pulse_index_new']
-filtered_meta_batch = filtered_meta_batch.drop(columns=['first_pulse_index_new', 'last_pulse_index_new'])
 metadata_end_time = time.time()
 print(f"Metadata update took {metadata_end_time - metadata_start_time:.2f} seconds.")
 
+#------------------------------------------------------
 print(f"Saving files...")
 save_start_time = time.time()
-# Save files (convert to pandas only for saving if needed)
-augmented_data_df = augmented_data_pl.to_pandas()  # Only convert once at the end
-
-# Save files
 filtered_meta_batch_path = Path('data/filtered_meta_batch_1.parquet')
 augmented_data_df_path = Path('data/augmented_data_df.parquet')
 
-filtered_meta_batch.to_parquet(filtered_meta_batch_path, index=False)
-augmented_data_df.to_parquet(augmented_data_df_path, index=False)
+filtered_meta_batch.write_parquet(filtered_meta_batch_path)
+augmented_data_pl.write_parquet(augmented_data_df_path)
 save_end_time = time.time()
 print(f"Saving files took {save_end_time - save_start_time:.2f} seconds.")
 
