@@ -15,6 +15,12 @@ with open(config_path, 'r') as f:
 with open(config2_path, 'r') as f:
     config2 = yaml.safe_load(f)
 
+# Check that all required keys are present in the config
+required_keys = ['TRAIN_TEST_SPLIT']
+for key in required_keys:
+    if key not in config2:
+        raise ValueError(f"Missing required config key: {key}")
+
 # Number of events to process
 NUM_EVENTS = config.get('NUM_EVENTS')
 if NUM_EVENTS == -1:

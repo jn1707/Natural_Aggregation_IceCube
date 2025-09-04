@@ -16,6 +16,12 @@ config_path = Path('01_Data_Augmentation/250901-base_config.yaml')
 with open(config_path, 'r') as f:
     config = yaml.safe_load(f)
 
+# Check that all required keys are present in the config
+required_keys = ['LATE_PULSES', 'NUM_EVENTS', 'AFTER_PULSES', 'NOISE']
+for key in required_keys:
+    if key not in config:
+        raise ValueError(f"Missing required config key: {key}")
+
 # Path to data files
 meta_path = Path('data/train_meta_batch_1.parquet')
 data_path = Path('data/batch_1.parquet')
@@ -421,6 +427,14 @@ print(f"Saving files...")
 save_start_time = time.time()
 filtered_meta_batch_path = Path('data/filtered_meta_batch_1.parquet')
 augmented_data_df_path = Path('data/augmented_data_df.parquet')
+
+# Make event_id negative
+filtered_meta_batch = filtered_meta_batch.with_columns([
+    (-pl.col('event_id')).alias('event_id')
+])
+augmented_data_pl = augmented_data_pl.with_columns([
+    (-pl.col('event_id')).alias('event_id')
+])
 
 filtered_meta_batch.write_parquet(filtered_meta_batch_path)
 augmented_data_pl.write_parquet(augmented_data_df_path)
